@@ -32,7 +32,7 @@ import itertools
 import os
 import re
 import sys
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from datetime import datetime
 from difflib import unified_diff
 from fnmatch import fnmatch
@@ -291,6 +291,8 @@ class SortImports(object):
         """If the current line is an import line it will return its type (from or straight)"""
         if "isort:skip" in line:
             return
+        elif "isort:stay" in line:
+            return "stay"
         elif line.startswith('import '):
             return "straight"
         elif line.startswith('from '):
@@ -364,28 +366,47 @@ class SortImports(object):
 
         return line
 
-    def _add_straight_imports(self, straight_modules, section, section_output):
+    def _add_straight_imports(self, straight_modules, section, section_output, stays):
+        # Output sticky "stays" that appear at the top of the block
+        section_output += stays[None]
+
         for module in straight_modules:
-            if module in self.remove_imports:
-                continue
+            if module not in self.remove_imports:
+                if module in self.as_map:
+                    import_definition = "import {0} as {1}".format(module, self.as_map[module])
+                else:
+                    import_definition = "import {0}".format(module)
 
-            if module in self.as_map:
-                import_definition = "import {0} as {1}".format(module, self.as_map[module])
+                comments_above = self.comments['above']['straight'].pop(module, None)
+                if comments_above:
+                    section_output.extend(comments_above)
+                section_output.append(self._add_comments(self.comments['straight'].get(module), import_definition))
+            # Output sticky "stays", even for removed imports.
+            section_output += stays[module]
+
+    def _split_stays_in_from_import(self, mixed_values):
+        # Sticky "stays" are in the ordered set, after an element
+        # that starts with "isort:stay"
+        mixed_values = list(mixed_values)
+        idx = 0
+        modules, stays = [], []
+        while idx < len(mixed_values):
+            if mixed_values[idx].startswith("isort:stay"):
+                stays.append(mixed_values[idx + 1])
+                idx += 2
             else:
-                import_definition = "import {0}".format(module)
-
-            comments_above = self.comments['above']['straight'].pop(module, None)
-            if comments_above:
-                section_output.extend(comments_above)
-            section_output.append(self._add_comments(self.comments['straight'].get(module), import_definition))
+                modules.append(mixed_values[idx])
+                idx += 1
+        return modules, stays
 
     def _add_from_imports(self, from_modules, section, section_output, ignore_case):
         for module in from_modules:
             if module in self.remove_imports:
                 continue
-
             import_start = "from {0} import ".format(module)
-            from_imports = self.imports[section]['from'][module]
+            # Split off the real imports from the sticky "stays"
+            from_imports, from_stays = self._split_stays_in_from_import(
+                self.imports[section]['from'][module])
             from_imports = nsorted(from_imports, key=lambda key: self._module_key(key, self.config, True, ignore_case))
             if self.remove_imports:
                 from_imports = [line for line in from_imports if not "{0}.{1}".format(module, line) in
@@ -406,7 +427,6 @@ class SortImports(object):
                         import_statement = self._add_comments(comments, self._wrap(import_statement))
                         from_imports.remove(from_import)
                         section_output.append(import_statement)
-
 
             if from_imports:
                 comments = self.comments['from'].pop(module, ())
@@ -473,6 +493,8 @@ class SortImports(object):
                     if above_comments:
                         section_output.extend(above_comments)
                     section_output.append(import_statement)
+            # Output all sticky "stays" after all massing for the "from" import.
+            section_output += from_stays
 
     def _multi_line_reformat(self, import_start, from_imports, comments):
         output_mode = settings.WrapModes._fields[self.config['multi_line_output']].lower()
@@ -501,6 +523,31 @@ class SortImports(object):
             return self._wrap(import_statement)
         return import_statement
 
+    def _split_stays_in_formatted_imports(self, mixed_values):
+        """
+        Separate modules from "stays".
+
+        Returns a list of modules and a dict of associated "stays"
+        """
+        mixed_values = list(mixed_values)
+        idx = 0
+        stays = defaultdict(lambda: [])
+        modules = []
+        while idx < len(mixed_values):
+            if not mixed_values[idx].startswith("isort:stay"):
+                modules.append(mixed_values[idx])
+                idx += 1
+            elif modules:
+                stays[modules[-1]].append(mixed_values[idx + 1])
+                idx += 2
+            else:
+                # No module yet; stuff it into None, which we'll
+                # have to deal with explicitly on output.
+                stays[None].append(mixed_values[idx + 1])
+                idx += 2
+        modules = OrderedSet(modules)
+        return modules, stays
+
     def _add_formatted_imports(self):
         """Adds the imports back to the file.
 
@@ -520,6 +567,14 @@ class SortImports(object):
         output = []
         for section in sections:
             straight_modules = self.imports[section]['straight']
+            # Split out stays from actual modules, into a dict for each actual module.
+            # We will look up the "stays" for each module on output.
+            straight_modules, stays = self._split_stays_in_formatted_imports(straight_modules)
+            if stays[None]:
+                # Special case: there are "stays" associated with no module
+                # (appearing at the top), and this emits an extra line.
+                # So decrement the internal variable for dealing with this.
+                self.import_index -= 1
             straight_modules = nsorted(straight_modules, key=lambda key: self._module_key(key, self.config))
             from_modules = self.imports[section]['from']
             from_modules = nsorted(from_modules, key=lambda key: self._module_key(key, self.config))
@@ -529,9 +584,9 @@ class SortImports(object):
                 self._add_from_imports(from_modules, section, section_output, sort_ignore_case)
                 if self.config['lines_between_types'] and from_modules and straight_modules:
                     section_output.extend([''] * self.config['lines_between_types'])
-                self._add_straight_imports(straight_modules, section, section_output)
+                self._add_straight_imports(straight_modules, section, section_output, stays)
             else:
-                self._add_straight_imports(straight_modules, section, section_output)
+                self._add_straight_imports(straight_modules, section, section_output, stays)
                 if self.config['lines_between_types'] and from_modules and straight_modules:
                     section_output.extend([''] * self.config['lines_between_types'])
                 self._add_from_imports(from_modules, section, section_output, sort_ignore_case)
@@ -782,6 +837,8 @@ class SortImports(object):
         """Parses a python file taking out and categorizing imports."""
         self._in_quote = False
         self._in_top_comment = False
+        last_import_type = 'straight'  # initialize for any isort:stay
+        placed_module = 'STDLIB'  # that appears before any imports
         while not self._at_end():
             line = self._get_line()
             statement_index = self.index
@@ -806,6 +863,17 @@ class SortImports(object):
             if not import_type or skip_line:
                 self.out_lines.append(line)
                 continue
+            elif import_type == "stay":
+                # Add to the previous import, to "stay" with it.
+                root = self.imports[placed_module][last_import_type]
+                if isinstance(root, OrderedDict):  # "from" import type
+                    root = root[import_from]  # guaranteed to exist from prev. loop iteration
+                # Since we have an OrderedSet, need to mark "sticky" imports
+                # with a unique string starting with "isort:stay"
+                num_stays = len([True for imp in root if imp.startswith("isort:stay")])
+                root.update(["isort:stay%d" % num_stays, line])
+                continue
+            last_import_type = import_type
 
             for line in (line.strip() for line in line.split(";")):
                 import_type = self._import_type(line)
@@ -863,6 +931,8 @@ class SortImports(object):
                             self.comments['straight'][module] = comments
                             comments = []
                         del imports[index:index + 2]
+
+                # Placement: from
                 if import_type == "from":
                     import_from = imports.pop(0)
                     placed_module = self.place_module(import_from)
@@ -896,6 +966,8 @@ class SortImports(object):
                         root[import_from].update(imports)
                     else:
                         root[import_from] = OrderedSet(imports)
+
+                # Placement: import
                 else:
                     for module in imports:
                         if comments:
